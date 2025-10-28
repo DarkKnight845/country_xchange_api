@@ -2,11 +2,11 @@ import os
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, func
@@ -90,11 +90,19 @@ def get_db():
 async def fetch_countries():
     """Fetch country data from REST Countries API"""
     url = "https://restcountries.com/v2/all?fields=name,capital,region,population,flag,currencies"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             response = await client.get(url)
             response.raise_for_status()
             return response.json()
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "External data source unavailable",
+                    "details": "Could not fetch data from REST Countries API: Request timeout",
+                },
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=503,
@@ -108,12 +116,20 @@ async def fetch_countries():
 async def fetch_exchange_rates():
     """Fetch exchange rates from Exchange Rate API"""
     url = "https://open.er-api.com/v6/latest/USD"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             response = await client.get(url)
             response.raise_for_status()
             data = response.json()
             return data.get("rates", {})
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "External data source unavailable",
+                    "details": "Could not fetch data from Exchange Rate API: Request timeout",
+                },
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=503,
@@ -165,8 +181,7 @@ def generate_summary_image(db: Session):
         text_font = ImageFont.truetype(
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18
         )
-    except Exception:
-        # Fallback to default fonts if truetype loading fails (do not catch system-exiting exceptions)
+    except:
         title_font = ImageFont.load_default()
         header_font = ImageFont.load_default()
         text_font = ImageFont.load_default()
@@ -222,79 +237,99 @@ async def refresh_countries():
 
     try:
         # Fetch data from external APIs
+        print("Fetching countries data...")
         countries_data = await fetch_countries()
+        print(f"Fetched {len(countries_data)} countries")
+
+        print("Fetching exchange rates...")
         exchange_rates = await fetch_exchange_rates()
+        print(f"Fetched {len(exchange_rates)} exchange rates")
 
         refresh_timestamp = datetime.utcnow()
+        processed = 0
 
         for country_data in countries_data:
-            name = country_data.get("name")
-            if not name:
-                continue
+            try:
+                name = country_data.get("name")
+                if not name:
+                    continue
 
-            population = country_data.get("population", 0)
-            if not population:
-                continue
+                population = country_data.get("population", 0)
+                if not population:
+                    continue
 
-            # Handle currency
-            currencies = country_data.get("currencies", [])
-            currency_code = None
-            exchange_rate = None
-            estimated_gdp = None
+                # Handle currency
+                currencies = country_data.get("currencies", [])
+                currency_code = None
+                exchange_rate = None
+                estimated_gdp = None
 
-            if currencies and len(currencies) > 0:
-                currency_code = currencies[0].get("code")
+                if currencies and len(currencies) > 0:
+                    currency_code = currencies[0].get("code")
 
-                if currency_code and currency_code in exchange_rates:
-                    exchange_rate = exchange_rates[currency_code]
-                    estimated_gdp = calculate_gdp(population, exchange_rate)
+                    if currency_code and currency_code in exchange_rates:
+                        exchange_rate = exchange_rates[currency_code]
+                        estimated_gdp = calculate_gdp(population, exchange_rate)
 
-            # If no currency, set GDP to 0
-            if not currency_code:
-                estimated_gdp = 0
+                # If no currency, set GDP to 0
+                if not currency_code:
+                    estimated_gdp = 0
 
-            # Check if country exists
-            existing_country = (
-                db.query(CountryModel)
-                .filter(func.lower(CountryModel.name) == name.lower())
-                .first()
-            )
-
-            if existing_country:
-                # Update existing
-                existing_country.capital = country_data.get("capital")
-                existing_country.region = country_data.get("region")
-                existing_country.population = population
-                existing_country.currency_code = currency_code
-                existing_country.exchange_rate = exchange_rate
-                existing_country.estimated_gdp = estimated_gdp
-                existing_country.flag_url = country_data.get("flag")
-                existing_country.last_refreshed_at = refresh_timestamp
-            else:
-                # Insert new
-                new_country = CountryModel(
-                    name=name,
-                    capital=country_data.get("capital"),
-                    region=country_data.get("region"),
-                    population=population,
-                    currency_code=currency_code,
-                    exchange_rate=exchange_rate,
-                    estimated_gdp=estimated_gdp,
-                    flag_url=country_data.get("flag"),
-                    last_refreshed_at=refresh_timestamp,
+                # Check if country exists
+                existing_country = (
+                    db.query(CountryModel)
+                    .filter(func.lower(CountryModel.name) == name.lower())
+                    .first()
                 )
-                db.add(new_country)
+
+                if existing_country:
+                    # Update existing
+                    existing_country.capital = country_data.get("capital")
+                    existing_country.region = country_data.get("region")
+                    existing_country.population = population
+                    existing_country.currency_code = currency_code
+                    existing_country.exchange_rate = exchange_rate
+                    existing_country.estimated_gdp = estimated_gdp
+                    existing_country.flag_url = country_data.get("flag")
+                    existing_country.last_refreshed_at = refresh_timestamp
+                else:
+                    # Insert new
+                    new_country = CountryModel(
+                        name=name,
+                        capital=country_data.get("capital"),
+                        region=country_data.get("region"),
+                        population=population,
+                        currency_code=currency_code,
+                        exchange_rate=exchange_rate,
+                        estimated_gdp=estimated_gdp,
+                        flag_url=country_data.get("flag"),
+                        last_refreshed_at=refresh_timestamp,
+                    )
+                    db.add(new_country)
+
+                processed += 1
+
+            except Exception as e:
+                print(
+                    f"Error processing country {country_data.get('name', 'unknown')}: {str(e)}"
+                )
+                continue
 
         db.commit()
+        print(f"Committed {processed} countries to database")
 
         # Generate summary image
-        generate_summary_image(db)
+        try:
+            generate_summary_image(db)
+            print("Generated summary image")
+        except Exception as e:
+            print(f"Error generating image: {str(e)}")
 
         total = db.query(CountryModel).count()
         return {
             "message": "Countries refreshed successfully",
             "total_countries": total,
-            "last_refreshed_at": refresh_timestamp,
+            "last_refreshed_at": refresh_timestamp.isoformat(),
         }
 
     except HTTPException:
@@ -302,15 +337,32 @@ async def refresh_countries():
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(
+        print(f"Error in refresh: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+        return JSONResponse(
             status_code=500,
-            detail={"error": "Internal server error", "details": str(e)},
+            content={"error": "Internal server error", "details": str(e)},
         )
     finally:
         db.close()
 
 
-@app.get("/countries", response_model=List[CountryResponse])
+@app.get("/countries/image")
+async def get_summary_image():
+    """Serve the generated summary image"""
+    image_path = "cache/summary.png"
+
+    if not os.path.exists(image_path):
+        return JSONResponse(
+            status_code=404, content={"error": "Summary image not found"}
+        )
+
+    return FileResponse(image_path, media_type="image/png")
+
+
+@app.get("/countries")
 async def get_countries(
     region: Optional[str] = Query(None),
     currency: Optional[str] = Query(None),
@@ -342,13 +394,34 @@ async def get_countries(
             query = query.order_by(CountryModel.name.desc())
 
         countries = query.all()
-        return countries
+
+        # Convert to dict format
+        result = []
+        for country in countries:
+            result.append(
+                {
+                    "id": country.id,
+                    "name": country.name,
+                    "capital": country.capital,
+                    "region": country.region,
+                    "population": country.population,
+                    "currency_code": country.currency_code,
+                    "exchange_rate": country.exchange_rate,
+                    "estimated_gdp": country.estimated_gdp,
+                    "flag_url": country.flag_url,
+                    "last_refreshed_at": country.last_refreshed_at.isoformat()
+                    if country.last_refreshed_at
+                    else None,
+                }
+            )
+
+        return result
 
     finally:
         db.close()
 
 
-@app.get("/countries/{name}", response_model=CountryResponse)
+@app.get("/countries/{name}")
 async def get_country(name: str):
     """Get a single country by name"""
     db = next(get_db())
@@ -361,9 +434,22 @@ async def get_country(name: str):
         )
 
         if not country:
-            raise HTTPException(status_code=404, detail={"error": "Country not found"})
+            return JSONResponse(status_code=404, content={"error": "Country not found"})
 
-        return country
+        return {
+            "id": country.id,
+            "name": country.name,
+            "capital": country.capital,
+            "region": country.region,
+            "population": country.population,
+            "currency_code": country.currency_code,
+            "exchange_rate": country.exchange_rate,
+            "estimated_gdp": country.estimated_gdp,
+            "flag_url": country.flag_url,
+            "last_refreshed_at": country.last_refreshed_at.isoformat()
+            if country.last_refreshed_at
+            else None,
+        }
 
     finally:
         db.close()
@@ -382,7 +468,7 @@ async def delete_country(name: str):
         )
 
         if not country:
-            raise HTTPException(status_code=404, detail={"error": "Country not found"})
+            return JSONResponse(status_code=404, content={"error": "Country not found"})
 
         db.delete(country)
         db.commit()
@@ -393,7 +479,7 @@ async def delete_country(name: str):
         db.close()
 
 
-@app.get("/status", response_model=StatusResponse)
+@app.get("/status")
 async def get_status():
     """Get system status"""
     db = next(get_db())
@@ -402,23 +488,36 @@ async def get_status():
         total = db.query(CountryModel).count()
         last_refresh = db.query(func.max(CountryModel.last_refreshed_at)).scalar()
 
-        return StatusResponse(total_countries=total, last_refreshed_at=last_refresh)
+        return {
+            "total_countries": total,
+            "last_refreshed_at": last_refresh.isoformat() if last_refresh else None,
+        }
 
     finally:
         db.close()
 
 
-@app.get("/countries/image")
-async def get_summary_image():
-    """Serve the generated summary image"""
-    image_path = "cache/summary.png"
+@app.get("/health")
+async def health_check():
+    """Health check endpoint to verify database connection"""
+    db = next(get_db())
 
-    if not os.path.exists(image_path):
-        raise HTTPException(
-            status_code=404, detail={"error": "Summary image not found"}
-        )
+    try:
+        # Try to query the database
+        db.execute("SELECT 1")
+        db_status = "connected"
+        db_type = "PostgreSQL" if "postgresql" in DATABASE_URL else "SQLite"
+    except Exception as e:
+        db_status = "disconnected"
+        db_type = "unknown"
+        return {
+            "status": "unhealthy",
+            "database": {"status": db_status, "type": db_type, "error": str(e)},
+        }
+    finally:
+        db.close()
 
-    return FileResponse(image_path, media_type="image/png")
+    return {"status": "healthy", "database": {"status": db_status, "type": db_type}}
 
 
 @app.get("/")
@@ -427,6 +526,7 @@ async def root():
     return {
         "message": "Country Currency & Exchange API",
         "endpoints": {
+            "GET /health": "Health check and database status",
             "POST /countries/refresh": "Refresh country data",
             "GET /countries": "Get all countries (supports ?region=, ?currency=, ?sort=)",
             "GET /countries/{name}": "Get country by name",
