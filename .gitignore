@@ -1,0 +1,5 @@
+# add .env file to .gitignore
+.env
+
+# add pyache to .gitignore
+__pycache__/
